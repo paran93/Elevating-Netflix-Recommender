@@ -8,6 +8,74 @@ import re
 from typing import Dict, List, Tuple, Optional
 import json
 import logging
+import streamlit as st
+
+# Performance optimization: Install faiss for faster vector search
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+    print("⚠️ FAISS not available. Install with: pip install faiss-cpu")
+
+# ⚡ OPTIMIZATION 1: Load model once with caching
+@st.cache_resource(show_spinner="🤖 Loading SentenceTransformer model...")
+def load_sentence_model():
+    """Load SentenceTransformer model once and cache it"""
+    try:
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        print("✅ SentenceTransformer loaded and cached successfully")
+        return model
+    except Exception as e:
+        print(f"❌ Error loading SentenceTransformer: {e}")
+        return None
+
+# ⚡ OPTIMIZATION 5: Cache query encoding
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def encode_query(query: str, _model):
+    """Encode query with caching"""
+    if _model is None:
+        return None
+    return _model.encode([query])[0]
+
+# ⚡ OPTIMIZATION 2: Cache embeddings computation
+@st.cache_data(ttl=3600, show_spinner="🔄 Computing content embeddings...")
+def compute_content_embeddings(searchable_texts: List[str], _model):
+    """Compute and cache content embeddings"""
+    if _model is None or not searchable_texts:
+        return None
+    try:
+        # ⚡ OPTIMIZATION 4: Disable progress bar for production
+        embeddings = _model.encode(searchable_texts, show_progress_bar=False)
+        print(f"✅ Computed and cached embeddings for {len(embeddings)} items")
+        return embeddings
+    except Exception as e:
+        print(f"❌ Error computing embeddings: {e}")
+        return None
+
+# ⚡ OPTIMIZATION 3: FAISS index for fast vector search
+@st.cache_resource(show_spinner="🚀 Building FAISS index...")
+def build_faiss_index(embeddings: np.ndarray):
+    """Build and cache FAISS index for fast similarity search"""
+    if not FAISS_AVAILABLE or embeddings is None:
+        return None
+    
+    try:
+        # Use L2 distance (can convert to cosine similarity)
+        dimension = embeddings.shape[1]
+        index = faiss.IndexFlatL2(dimension)
+        
+        # Normalize embeddings for cosine similarity
+        faiss.normalize_L2(embeddings)
+        
+        # Add embeddings to index
+        index.add(embeddings.astype(np.float32))
+        
+        print(f"✅ Built FAISS index with {index.ntotal} vectors")
+        return index
+    except Exception as e:
+        print(f"❌ Error building FAISS index: {e}")
+        return None
 
 class MoodExtractor:
     """Extract mood and intent from natural language queries"""
@@ -269,19 +337,14 @@ class MoodExtractor:
         }
 
 class EnhancedRecommendationEngine:
-    """Enhanced recommendation engine with SentenceTransformers and Anthropic"""
+    """Enhanced recommendation engine with optimized performance"""
     
     def __init__(self, netflix_data: Dict, anthropic_api_key: str = None):
         self.netflix_data = netflix_data
         self.mood_extractor = MoodExtractor()
         
-        # Initialize SentenceTransformer
-        try:
-            self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
-            print("✅ SentenceTransformer loaded successfully")
-        except Exception as e:
-            print(f"❌ Error loading SentenceTransformer: {e}")
-            self.sentence_model = None
+        # ⚡ OPTIMIZATION 1: Load model once with caching
+        self.sentence_model = load_sentence_model()
         
         # Initialize Anthropic client
         self.anthropic_client = None
@@ -294,11 +357,38 @@ class EnhancedRecommendationEngine:
         
         # Process data
         self.content_df = self._process_netflix_data()
-        self.content_embeddings = self._create_content_embeddings()
+        
+        # ⚡ OPTIMIZATION 2 & 3: Pre-compute embeddings and FAISS index
+        self._setup_embeddings_and_index()
         
         # Recommendation thresholds
         self.confidence_threshold = 0.3
         self.min_recommendations = 3
+    
+    def _setup_embeddings_and_index(self):
+        """Setup embeddings and FAISS index with caching"""
+        try:
+            if self.sentence_model is None or self.content_df.empty:
+                self.content_embeddings = None
+                self.faiss_index = None
+                return
+            
+            # Get searchable texts
+            searchable_texts = self.content_df['searchable_text'].tolist()
+            
+            # ⚡ OPTIMIZATION 2: Compute embeddings with caching
+            self.content_embeddings = compute_content_embeddings(searchable_texts, self.sentence_model)
+            
+            # ⚡ OPTIMIZATION 3: Build FAISS index with caching
+            if self.content_embeddings is not None:
+                self.faiss_index = build_faiss_index(self.content_embeddings)
+            else:
+                self.faiss_index = None
+                
+        except Exception as e:
+            print(f"❌ Error setting up embeddings and index: {e}")
+            self.content_embeddings = None
+            self.faiss_index = None
     
     def _extract_year_from_title(self, title_with_year):
         """Extract year from title_with_year field"""
@@ -546,22 +636,8 @@ class EnhancedRecommendationEngine:
             print(traceback.format_exc())
             return pd.DataFrame()
     
-    def _create_content_embeddings(self) -> np.ndarray:
-        """Create sentence embeddings for all content"""
-        if self.sentence_model is None or self.content_df.empty:
-            return None
-        
-        try:
-            texts = self.content_df['searchable_text'].tolist()
-            embeddings = self.sentence_model.encode(texts, show_progress_bar=False)
-            print(f"✅ Created embeddings for {len(embeddings)} items")
-            return embeddings
-        except Exception as e:
-            print(f"❌ Error creating embeddings: {e}")
-            return None
-    
     def get_recommendations(self, query: str, top_k: int = 5) -> Dict:
-        """Get recommendations using multiple approaches"""
+        """Get recommendations using multiple approaches with optimized performance"""
         try:
             print(f"🎯 DEBUG - Getting recommendations for: '{query}'")
             
@@ -569,7 +645,7 @@ class EnhancedRecommendationEngine:
             mood_analysis = self.mood_extractor.extract_mood_and_genre(query)
             
             # Get recommendations using different methods
-            embedding_recs = self._get_embedding_recommendations(query, top_k * 2)
+            embedding_recs = self._get_embedding_recommendations_optimized(query, top_k * 2)
             mood_genre_recs = self._get_mood_genre_recommendations(mood_analysis, top_k * 2)
             
             print(f"🔍 DEBUG - Found {len(embedding_recs)} embedding recs, {len(mood_genre_recs)} mood/genre recs")
@@ -621,26 +697,52 @@ class EnhancedRecommendationEngine:
                 'content_breakdown': {'movies': 0, 'shows': 0, 'total': 0}
             }
     
-    def _get_embedding_recommendations(self, query: str, top_k: int) -> List[Dict]:
-        """Get recommendations using sentence embeddings"""
+    def _get_embedding_recommendations_optimized(self, query: str, top_k: int) -> List[Dict]:
+        """⚡ OPTIMIZED: Get recommendations using cached embeddings and FAISS"""
         try:
-            print(f"🔍 DEBUG - Getting embedding recommendations...")
+            print(f"🚀 DEBUG - Getting OPTIMIZED embedding recommendations...")
             
-            if self.sentence_model is None or self.content_embeddings is None or self.content_df.empty:
-                print("   No sentence model, embeddings, or content available")
+            if self.sentence_model is None or self.content_df.empty:
+                print("   No sentence model or content available")
                 return []
             
-            # Encode query
-            query_embedding = self.sentence_model.encode([query])
+            # ⚡ OPTIMIZATION 5: Use cached query encoding
+            query_embedding = encode_query(query, self.sentence_model)
+            if query_embedding is None:
+                print("   Failed to encode query")
+                return []
             
-            # Calculate similarities
-            similarities = cosine_similarity(query_embedding, self.content_embeddings)[0]
-            
-            # Get top recommendations
-            top_indices = np.argsort(similarities)[::-1][:top_k]
+            # ⚡ OPTIMIZATION 3: Use FAISS for fast similarity search
+            if self.faiss_index is not None and FAISS_AVAILABLE:
+                print("   Using FAISS for fast similarity search")
+                try:
+                    # Normalize query embedding for cosine similarity
+                    query_embedding_normalized = query_embedding.reshape(1, -1).astype(np.float32)
+                    faiss.normalize_L2(query_embedding_normalized)
+                    
+                    # Search FAISS index
+                    distances, indices = self.faiss_index.search(query_embedding_normalized, top_k)
+                    
+                    # Convert L2 distances to cosine similarities
+                    similarities = 1 - (distances[0] / 2)  # Convert L2 to cosine similarity
+                    top_indices = indices[0]
+                    
+                    print(f"   FAISS found {len(top_indices)} results")
+                except Exception as faiss_error:
+                    print(f"   FAISS search failed: {faiss_error}, falling back to sklearn")
+                    # Fallback to sklearn if FAISS fails
+                    similarities = cosine_similarity([query_embedding], self.content_embeddings)[0]
+                    top_indices = np.argsort(similarities)[::-1][:top_k]
+                    similarities = similarities[top_indices]
+            else:
+                print("   Using sklearn cosine similarity (FAISS not available)")
+                # Fallback to sklearn cosine similarity
+                similarities = cosine_similarity([query_embedding], self.content_embeddings)[0]
+                top_indices = np.argsort(similarities)[::-1][:top_k]
+                similarities = similarities[top_indices]
             
             recommendations = []
-            for idx in top_indices:
+            for i, idx in enumerate(top_indices):
                 try:
                     content = self.content_df.iloc[idx]
                     
@@ -651,8 +753,8 @@ class EnhancedRecommendationEngine:
                         'genre': list(content.get('genre', [])),
                         'mood': list(content.get('mood', [])),
                         'synopsis': str(content.get('synopsis', ''))[:200] + ('...' if len(str(content.get('synopsis', ''))) > 200 else ''),
-                        'similarity_score': float(similarities[idx]),
-                        'method': 'embedding',
+                        'similarity_score': float(similarities[i]),
+                        'method': 'embedding_optimized',
                         'language': str(content.get('language', 'Unknown')),
                         'rating': str(content.get('rating', 'N/A')),
                         'director': list(content.get('director', [])),
@@ -660,20 +762,17 @@ class EnhancedRecommendationEngine:
                     }
                     
                     # DEBUG: Print recommendation details
-                    print(f"   Embedding rec: {rec['title']}")
-                    print(f"      Original genre from DF: {content.get('genre')} -> Rec genre: {rec['genre']}")
-                    print(f"      Original mood from DF: {content.get('mood')} -> Rec mood: {rec['mood']}")
-                    print(f"      Original language from DF: {content.get('language')} -> Rec language: {rec['language']}")
+                    print(f"   Optimized embedding rec: {rec['title']} (score: {rec['similarity_score']:.3f})")
                     
                     recommendations.append(rec)
                 except Exception as e:
                     print(f"   Error processing embedding rec {idx}: {e}")
                     continue
             
-            print(f"   Generated {len(recommendations)} embedding recommendations")
+            print(f"   Generated {len(recommendations)} optimized embedding recommendations")
             return recommendations
         except Exception as e:
-            print(f"❌ Error in embedding recommendations: {e}")
+            print(f"❌ Error in optimized embedding recommendations: {e}")
             return []
     
     def _get_mood_genre_recommendations(self, mood_analysis: Dict, top_k: int) -> List[Dict]:
